@@ -12,6 +12,9 @@ services:
       # ホスト側の bind 先は .env の OAUTH_SERVER_HOST / PORT で指定
       - "${OAUTH_SERVER_HOST:-127.0.0.1}:${OAUTH_SERVER_PORT:-3000}:${OAUTH_SERVER_PORT:-3000}"
     volumes:
-      # 暗号化済 refresh_token を永続化
-      - ./.data:/app/.data
+      # 暗号化済 refresh_token を永続化（named volume で uid ずれを回避）
+      - syabere-data:/app/.data
     stop_grace_period: 15s
+
+volumes:
+  syabere-data:
