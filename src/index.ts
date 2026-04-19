@@ -361,18 +361,12 @@ async function cmdStop(ix: import("discord.js").ChatInputCommandInteraction) {
 
   meetings.delete(ix.guild.id);
   await ix.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let url: string;
   try {
-    const { url } = await meeting.stop();
-    await ix.editReply({
-      embeds: [
-        successEmbed(
-          "📝 議事録を終了しました",
-          `要約をドキュメントの先頭に追記しました。\n[ドキュメントを開く](${url})`,
-        ),
-      ],
-    });
+    ({ url } = await meeting.stopRecording());
   } catch (err) {
-    console.error("[meeting] stop failed:", err);
+    console.error("[meeting] stopRecording failed:", err);
     await ix.editReply({
       embeds: [
         errorEmbed(
@@ -381,7 +375,47 @@ async function cmdStop(ix: import("discord.js").ChatInputCommandInteraction) {
         ),
       ],
     });
+    return;
   }
+
+  await ix.editReply({
+    embeds: [
+      infoEmbed(
+        "📝 議事録の記録を終了しました",
+        `文字起こしを保存しました。要約は裏で生成中です…\n[ドキュメントを開く](${url})`,
+      ),
+    ],
+  });
+
+  // Fire-and-forget: Gemini summarization is slow (seconds–tens of seconds).
+  // The interaction's followUp window is 15 min, plenty of headroom.
+  void meeting
+    .finalizeWithSummary()
+    .then(() =>
+      ix.followUp({
+        embeds: [
+          successEmbed(
+            "✓ 要約を追記しました",
+            `ドキュメントの先頭に要約を追加しました。\n[ドキュメントを開く](${url})`,
+          ),
+        ],
+        flags: MessageFlags.Ephemeral,
+      }),
+    )
+    .catch(async (err) => {
+      console.error("[meeting] finalizeWithSummary failed:", err);
+      await ix
+        .followUp({
+          embeds: [
+            errorEmbed(
+              "要約の生成に失敗しました",
+              "文字起こし本体は保存済みです。",
+            ),
+          ],
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch((e) => console.error("[cmdStop] followUp failed:", e));
+    });
 }
 
 const shutdown = async (signal: string) => {

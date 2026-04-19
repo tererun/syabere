@@ -149,7 +149,7 @@ Discord VC (per-user opus)
 
 giziroku `/stream/transcribe` は `STREAM_CHUNK_SECONDS`（既定 5s）で区切って Whisper に渡す。そのため:
 
-- 短いバーストは Whisper が文脈不足で精度を落とす → `AfterSilence` を 2.5s にして session を繋げている
+- voice session は `EndBehaviorType.Manual` で 1 ユーザー = 1 giziroku WS を会議中ずっと維持する。以前は `AfterSilence` で 2.5s 無音ごとに session を閉じていたが、閉じ切るまでの間に来た発話が `speaking.on("start")` の早期 return で丸ごと捨てられていた（Docs に前半が出ない原因）。Manual にしたので `/stop` の `bridge.shutdown()` で opus stream を `destroy()` → pipeline 'end' → `giziroku.flushAndClose` の順で閉じる
 - チャンク境界で単語/文が切れるのは Whisper streaming の性質。完全な文境界が必要なら POST `/transcribe` のファイルモードに切り替える必要がある
 - `initial_prompt` に固有名詞を並べると精度が上がる（`GIZIROKU_INITIAL_PROMPT`）
 

@@ -18,6 +18,8 @@ export class Meeting {
   private bridge: VoiceBridge | null = null;
   private msgHandler: ((m: Message) => void) | null = null;
   private disposed = false;
+  /** kind:userId of the previous utterance; used to merge consecutive same-speaker segments. */
+  private lastKey: string | null = null;
 
   constructor(
     private readonly guild: Guild,
@@ -35,7 +37,7 @@ export class Meeting {
     const now = new Date();
     const title = `会議録 ${this.voiceChannel.name} ${formatTitleDate(now)}`;
     const url = await this.doc.create(title);
-    this.bridge = new VoiceBridge(this.connection, this.guild, this);
+    this.bridge = new VoiceBridge(this.connection, this.guild, this.voiceChannel, this);
 
     this.msgHandler = (m) => {
       if (m.channelId !== this.voiceChannel.id) return;
@@ -56,12 +58,26 @@ export class Meeting {
   }
 
   addUtterance(u: Utterance): void {
+    const currentKey = `${u.kind}:${u.userId}`;
+    if (currentKey === this.lastKey) {
+      this.doc.append(` ${u.text}`);
+      return;
+    }
     const label =
       u.kind === "text" ? `@${u.displayName} (チャット)` : `@${u.displayName}`;
-    this.doc.append(`${label}: ${u.text}\n\n`);
+    const prefix = this.lastKey === null ? "" : "\n\n";
+    this.doc.append(`${prefix}${label}: ${u.text}`);
+    this.lastKey = currentKey;
   }
 
-  async stop(): Promise<{ url: string; docId: string }> {
+  /**
+   * Stop recording: detach Discord handlers, close the audio pipeline, flush
+   * any trailing transcript into the Doc. Cheap and fast — safe to await
+   * before replying to the `/stop` interaction. The Gemini summary step is
+   * deliberately NOT run here; call {@link finalizeWithSummary} in the
+   * background after replying.
+   */
+  async stopRecording(): Promise<{ url: string; docId: string }> {
     if (this.disposed) return { url: this.doc.docUrl, docId: this.doc.docId };
     this.disposed = true;
 
@@ -84,11 +100,19 @@ export class Meeting {
     // Let any trailing partial results land before we snapshot the doc.
     await sleep(3_000);
 
-    // Drain the buffered appends so the summary sees the final utterances —
-    // otherwise getPlainText() returns only what was already flushed to Docs
-    // and Gemini summarizes a truncated transcript.
+    // Drain the buffered appends so the full transcript is durable in Docs
+    // even if the summary step fails or the process is killed.
     await this.doc.flush();
 
+    return { url: this.doc.docUrl, docId: this.doc.docId };
+  }
+
+  /**
+   * Generate the Gemini summary and prepend it at index=1 in the Doc. Slow
+   * (network + LLM). Run this in the background after {@link stopRecording}
+   * so the `/stop` reply isn't blocked on the LLM.
+   */
+  async finalizeWithSummary(): Promise<void> {
     const transcript = await this.doc.getPlainText();
     let summary: string;
     try {
@@ -98,7 +122,13 @@ export class Meeting {
       summary = "(要約の生成に失敗しました)";
     }
     await this.doc.finalize(summary);
-    return { url: this.doc.docUrl, docId: this.doc.docId };
+  }
+
+  /** Convenience: full shutdown (recording stop + summary). Used by SIGINT. */
+  async stop(): Promise<{ url: string; docId: string }> {
+    const res = await this.stopRecording();
+    await this.finalizeWithSummary();
+    return res;
   }
 }
 

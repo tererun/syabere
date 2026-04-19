@@ -1,6 +1,6 @@
 import { EndBehaviorType } from "@discordjs/voice";
 import type { VoiceConnection } from "@discordjs/voice";
-import type { Guild } from "discord.js";
+import type { Guild, VoiceBasedChannel } from "discord.js";
 import { FFmpeg } from "prism-media";
 import type { Duplex, Readable } from "stream";
 import { GizirokuStream } from "./giziroku.ts";
@@ -10,6 +10,9 @@ import { OggOpusMuxer } from "./ogg-opus.ts";
 
 type UserSession = {
   giziroku: GizirokuStream;
+  opusStream: Readable;
+  ogg: OggOpusMuxer;
+  done: Promise<void>;
   closing: boolean;
 };
 
@@ -17,41 +20,54 @@ type UserSession = {
  * Bridges Discord per-user voice streams into per-user giziroku WebSocket
  * sessions.
  *
- * Audio pipeline (per speaking session):
+ * Audio pipeline (per user, lives for the whole meeting):
  *   Discord Opus packet
  *     → OggOpusMuxer (ours, pure JS) : wraps raw Opus in Ogg pages
  *     → ffmpeg subprocess             : decodes, resamples 48kHz/stereo → 16kHz/mono
  *     → giziroku WebSocket
  *
- * We own the Ogg muxing because the only good npm implementation pulls in
- * node-crc, a napi-rs native dep that can't build under Bun without Rust.
+ * We use EndBehaviorType.Manual and keep one subscription per user for the
+ * entire meeting. AfterSilence tore the stream down every 2.5s, which dropped
+ * audio between a session closing and the next speaking.start firing — so the
+ * earliest seconds of every speech burst were silently discarded.
  */
 export class VoiceBridge {
   private readonly sessions = new Map<string, UserSession>();
+  private readonly speakingHandler: (userId: string) => void;
 
   constructor(
     private readonly connection: VoiceConnection,
     private readonly guild: Guild,
+    private readonly voiceChannel: VoiceBasedChannel,
     private readonly meeting: Meeting,
   ) {
-    this.connection.receiver.speaking.on("start", (userId) => {
+    // Subscribe proactively for everyone already in the VC — speaking.start
+    // only fires on a fresh silence→speech edge, so a user who was already
+    // talking when the bot joined would otherwise never be captured.
+    for (const member of this.voiceChannel.members.values()) {
+      if (member.user.bot) continue;
+      this.startUserSession(member.id).catch((err) => {
+        console.error(`[voice] startUserSession(${member.id}) failed:`, err);
+      });
+    }
+
+    this.speakingHandler = (userId) => {
       this.startUserSession(userId).catch((err) => {
         console.error(`[voice] startUserSession(${userId}) failed:`, err);
       });
-    });
+    };
+    this.connection.receiver.speaking.on("start", this.speakingHandler);
   }
 
   private async startUserSession(userId: string): Promise<void> {
     if (this.sessions.has(userId)) return;
 
     const member = await this.guild.members.fetch(userId).catch(() => null);
+    if (member?.user.bot) return;
     const displayName = member?.displayName ?? member?.user.username ?? userId;
 
     const opusStream = this.connection.receiver.subscribe(userId, {
-      // End a speaking session only after 2.5s of continuous silence.
-      // Shorter values fragment natural pauses into separate giziroku jobs
-      // and very short chunks transcribe poorly (Whisper needs context).
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 2500 },
+      end: { behavior: EndBehaviorType.Manual },
     });
 
     // One packet per Ogg page = ~20 ms of audio reaches ffmpeg immediately,
@@ -90,7 +106,12 @@ export class VoiceBridge {
       onError: (err) => console.error(`[giziroku ${displayName}]`, err),
     });
 
-    const session: UserSession = { giziroku, closing: false };
+    let resolveDone!: () => void;
+    const done = new Promise<void>((r) => {
+      resolveDone = r;
+    });
+
+    const session: UserSession = { giziroku, opusStream, ogg, done, closing: false };
     this.sessions.set(userId, session);
 
     // prism-media's FFmpeg is a Duplex at runtime but its shipped typings
@@ -108,10 +129,12 @@ export class VoiceBridge {
         await giziroku.flushAndClose();
       } finally {
         this.sessions.delete(userId);
+        resolveDone();
       }
     };
 
     pipeline.on("end", () => void cleanup());
+    pipeline.on("close", () => void cleanup());
     pipeline.on("error", (err) => {
       console.error(`[voice ${displayName}] pipeline error:`, err);
       void cleanup();
@@ -136,13 +159,20 @@ export class VoiceBridge {
   }
 
   async shutdown(): Promise<void> {
+    this.connection.receiver.speaking.off("start", this.speakingHandler);
     const sessions = [...this.sessions.values()];
-    this.sessions.clear();
     await Promise.all(
       sessions.map(async (s) => {
-        if (s.closing) return;
-        s.closing = true;
-        await s.giziroku.flushAndClose().catch(() => undefined);
+        // opusStream.destroy() only emits 'close' — it does NOT propagate
+        // EOF through pipe(), so ogg/ffmpeg would hang waiting for input
+        // and pipeline 'end' would never fire. Unpipe the source, then
+        // call ogg.end() so the Transform's _flush runs, propagating EOF
+        // to ffmpeg's stdin → ffmpeg drains PCM → pipeline 'end' →
+        // cleanup() → giziroku.flushAndClose.
+        s.opusStream.unpipe();
+        s.opusStream.destroy();
+        s.ogg.end();
+        await s.done;
       }),
     );
   }
