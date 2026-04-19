@@ -1,0 +1,45 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# Python virtualenv
+.venv/
+
+# Editor / IDE
+.idea
+.vscode
+*.swp
+
+# Claude Code local settings
+.claude/
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Local token store (encrypted refresh tokens + any secrets on disk)
+.data/
